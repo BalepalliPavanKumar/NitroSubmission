@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>CSV Upload</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 800px; margin: 40px auto; padding: 0 16px; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button { padding: 8px 14px; border-radius: 8px; border: 1px solid #111827; background: #111827; color: #fff; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .progress { height: 10px; background: #e5e7eb; border-radius: 8px; overflow: hidden; margin-top: 8px; }
+    .bar { height: 100%; width: 0%; background: #10b981; transition: width .2s ease; }
+    pre { background: #0b1020; color: #e5e7eb; padding: 12px; border-radius: 8px; overflow: auto; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; }
+    .muted { color: #6b7280; }
+  </style>
+</head>
+<body>
+
+  <h1>Upload & Parse CSV</h1>
+
+  <div class="card">
+    <div class="row">
+      <input id="fileInput" type="file" />
+      <button id="uploadBtn">Upload</button>
+      <span id="status" class="muted"></span>
+    </div>
+    <div class="progress" aria-hidden="true"><div id="bar" class="bar"></div></div>
+    <div id="serverStatus" class="muted" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="listBtn">List Files</button>
+    </div>
+    <div id="filesList" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="card">
+    <h3>Parsed Content</h3>
+    <div id="content"></div>
+  </div>
+
+<script>
+  // Change this if your API runs elsewhere, e.g. "http://localhost:3000"
+  const API_BASE = "http://localhost:3000";
+
+  const fileInput = document.getElementById('fileInput');
+  const uploadBtn = document.getElementById('uploadBtn');
+  const statusEl = document.getElementById('status');
+  const serverStatusEl = document.getElementById('serverStatus');
+  const bar = document.getElementById('bar');
+  const contentEl = document.getElementById('content');
+  const filesList = document.getElementById('filesList');
+  const listBtn = document.getElementById('listBtn');
+
+  let pollTimer = null;
+
+  function setBar(percent) {
+    bar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  }
+
+  function setStatus(msg) {
+    statusEl.textContent = msg || "";
+  }
+
+  function setServerStatus(msg) {
+    serverStatusEl.textContent = msg || "";
+  }
+
+  function renderTable(rows) {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return '<div class="muted">No rows found.</div>';
+    }
+    const headers = Object.keys(rows[0]);
+    const thead = `<thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}</tr></thead>`;
+    const tbody = `<tbody>${
+      rows.map(r => `<tr>${headers.map(h => `<td>${escapeHtml(String(r[h] ?? ""))}</td>`).join('')}</tr>`).join('')
+    }</tbody>`;
+    return `<table>${thead}${tbody}</table>`;
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  // Upload using XMLHttpRequest to get upload progress
+  uploadBtn.addEventListener('click', () => {
+    contentEl.innerHTML = "";
+    setBar(0);
+    setStatus("");
+    setServerStatus("");
+
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      setStatus("Please choose a file first.");
+      return;
+    }
+
+    uploadBtn.disabled = true;
+
+    const form = new FormData();
+    form.append('file', file); // field name must be "file" (matches your server)
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE}/files`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const pct = (e.loaded / e.total) * 100;
+        setBar(pct);
+        setStatus(`Uploading… ${pct.toFixed(0)}%`);
+      } else {
+        setStatus(`Uploading…`);
+      }
+    };
+
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState === 4) {
+        uploadBtn.disabled = false;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const { file_id } = JSON.parse(xhr.responseText);
+          setStatus("Upload complete. Processing…");
+          setBar(100);
+          startPolling(file_id);
+        } else {
+          setStatus(`Upload failed: ${xhr.status} ${xhr.statusText}`);
+        }
+      }
+    };
+
+    xhr.send(form);
+  });
+
+  function startPolling(fileId) {
+    clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/files/${fileId}/progress`);
+        if (!res.ok) throw new Error(res.statusText);
+        const { status, progress } = await res.json();
+        setServerStatus(`Server status: ${status} (${progress}%)`);
+        setBar(progress);
+
+        if (status === 'ready') {
+          clearInterval(pollTimer);
+          await loadContent(fileId);
+          setServerStatus("Done.");
+        } else if (status === 'failed') {
+          clearInterval(pollTimer);
+          setServerStatus("Processing failed.");
+        }
+      } catch (err) {
+        clearInterval(pollTimer);
+        setServerStatus(`Error polling: ${err.message}`);
+      }
+    }, 800);
+  }
+
+  async function loadContent(fileId) {
+    try {
+      const res = await fetch(`${API_BASE}/files/${fileId}`);
+      const data = await res.json();
+      if (data.content) {
+        contentEl.innerHTML = renderTable(data.content);
+      } else {
+        contentEl.innerHTML = `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+      }
+    } catch (err) {
+      contentEl.textContent = `Failed to load content: ${err.message}`;
+    }
+  }
+
+  listBtn.addEventListener('click', async () => {
+    filesList.innerHTML = 'Loading…';
+    try {
+      const res = await fetch(`${API_BASE}/files`);
+      const files = await res.json();
+      if (!Array.isArray(files) || files.length === 0) {
+        filesList.innerHTML = '<div class="muted">No files yet.</div>';
+        return;
+      }
+      filesList.innerHTML = files.map(f => `
+        <div class="row" style="justify-content: space-between;">
+          <div>
+            <strong>${escapeHtml(f.filename || '(no name)')}</strong>
+            <div class="muted">status: ${escapeHtml(f.status || '')}, progress: ${f.progress ?? 0}%</div>
+          </div>
+          <div class="row">
+            <button onclick="fetchFile('${f._id}')">View</button>
+            <button onclick="deleteFile('${f._id}')">Delete</button>
+          </div>
+        </div>
+      `).join('<hr/>');
+    } catch (e) {
+      filesList.innerHTML = `Failed to list files: ${e.message}`;
+    }
+  });
+
+  window.fetchFile = async (id) => {
+    setServerStatus("");
+    await loadContent(id);
+  };
+
+  window.deleteFile = async (id) => {
+    if (!confirm("Delete this file?")) return;
+    try {
+      const res = await fetch(`${API_BASE}/files/${id}`, { method: 'DELETE' });
+      const data = await res.json();
+      setServerStatus(data.message || 'Deleted');
+      // refresh list
+      listBtn.click();
+      // clear content if it belonged to the deleted file
+      contentEl.innerHTML = "";
+    } catch (e) {
+      setServerStatus(`Delete failed: ${e.message}`);
+    }
+  };
+</script>
+</body>
+</html>
